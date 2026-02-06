@@ -1,0 +1,252 @@
+name: CI/CD Pipeline - Self-Hosted Optimized
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, linux, x64, dotnet]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    # Skip setup-dotnet if .NET is pre-installed on runner
+    # - name: Setup .NET
+    #   uses: actions/setup-dotnet@v3
+    #   with:
+    #     dotnet-version: '8.0.x'
+    
+    - name: Verify .NET Installation
+      run: dotnet --version
+    
+    - name: Restore dependencies
+      run: dotnet restore
+    
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+    
+    - name: Run tests
+      run: dotnet test --configuration Release --no-build --verbosity normal
+    
+    - name: Code coverage
+      run: dotnet test --configuration Release --no-build /p:CollectCoverage=true /p:CoverageFormat=opencover
+
+  security-scan:
+    runs-on: [self-hosted, linux, x64]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  build-docker:
+    needs: [build-and-test, security-scan]
+    runs-on: [self-hosted, linux, x64, docker]
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    # Skip setup-buildx-action for self-hosted (assume already configured)
+    # - name: Set up Docker Buildx
+    #   uses: docker/setup-buildx-action@v2
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        builder: default
+        provenance: false
+
+  deploy-staging:
+    needs: build-docker
+    runs-on: [self-hosted, linux, x64, docker]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.your-domain.com
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to Staging
+      env:
+        DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.STAGING_HOST }}
+        DEPLOY_USER: ${{ secrets.STAGING_USER }}
+      run: |
+        mkdir -p ~/.ssh
+        echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+        
+        ssh -i ~/.ssh/deploy_key $DEPLOY_USER@$DEPLOY_HOST << 'EOF'
+          cd /app/website
+          git pull origin develop
+          docker-compose pull
+          docker-compose up -d
+          
+          # Health check
+          for i in {1..30}; do
+            if curl -sf http://localhost/health > /dev/null 2>&1; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check failed!"
+          exit 1
+        EOF
+
+  deploy-production:
+    needs: build-docker
+    runs-on: [self-hosted, linux, x64, docker]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://your-domain.com
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Create Backup (Production)
+      env:
+        DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+        DEPLOY_USER: ${{ secrets.PROD_USER }}
+        DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+      run: |
+        mkdir -p ~/.ssh
+        echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+        
+        ssh -i ~/.ssh/deploy_key $DEPLOY_USER@$DEPLOY_HOST << 'EOF'
+          cd /app/website
+          mkdir -p /app/backups
+          docker-compose exec -T web tar -czf /tmp/backup-$(date +%Y%m%d-%H%M%S).tar.gz /app/publish || true
+          mv /tmp/backup-*.tar.gz /app/backups/ || true
+        EOF
+    
+    - name: Deploy to Production
+      env:
+        DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+        DEPLOY_USER: ${{ secrets.PROD_USER }}
+      run: |
+        mkdir -p ~/.ssh
+        echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+        
+        ssh -i ~/.ssh/deploy_key $DEPLOY_USER@$DEPLOY_HOST << 'EOF'
+          set -e
+          cd /app/website
+          git pull origin main
+          docker-compose pull
+          docker-compose up -d
+          
+          # Wait for database to be ready
+          sleep 10
+          
+          # Run migrations
+          docker-compose exec -T web dotnet migrate || echo "Migrations may not be needed"
+          
+          # Health check with automatic rollback
+          for i in {1..30}; do
+            if curl -sf http://localhost/health > /dev/null 2>&1; then
+              echo "Health check passed! Production deployment successful."
+              exit 0
+            fi
+            sleep 2
+          done
+          
+          echo "Health check failed! Rolling back..."
+          docker-compose down
+          git reset --hard HEAD~1
+          docker-compose pull
+          docker-compose up -d
+          exit 1
+        EOF
+
+  notify:
+    needs: [deploy-staging, deploy-production]
+    runs-on: [self-hosted, linux, x64]
+    if: always()
+    
+    steps:
+    - name: Notify Slack on Success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: 'Deployment successful! Check your application at the environment URL.'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+    
+    - name: Notify Slack on Failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: 'Deployment failed! Check the workflow logs for details.'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  cleanup:
+    needs: [deploy-staging, deploy-production]
+    runs-on: [self-hosted, linux, x64, docker]
+    if: always()
+    
+    steps:
+    - name: Clean up Docker resources
+      run: |
+        # Remove dangling images (older than 24 hours)
+        docker image prune -a -f --filter "until=24h" || true
+        
+        # Remove unused volumes
+        docker volume prune -f || true
+        
+        # Remove unused networks
+        docker network prune -f || true
+        
+        echo "Docker cleanup completed"

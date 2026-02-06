@@ -1,0 +1,257 @@
+name: CI/CD Pipeline - Windows Self-Hosted
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, windows, x64]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Restore dependencies
+      run: dotnet restore
+    
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+    
+    - name: Run tests
+      run: dotnet test --configuration Release --no-build --verbosity normal
+    
+    - name: Code coverage
+      run: dotnet test --configuration Release --no-build /p:CollectCoverage=true /p:CoverageFormat=opencover
+
+  security-scan:
+    runs-on: [self-hosted, windows, x64]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+      continue-on-error: true
+    
+    - name: Upload Trivy results to GitHub Security
+      if: always()
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+      continue-on-error: true
+
+  build-docker:
+    needs: [build-and-test, security-scan]
+    runs-on: [self-hosted, windows, x64]
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+      continue-on-error: true
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  deploy-staging:
+    needs: build-docker
+    runs-on: [self-hosted, windows, x64]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.your-domain.com
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to Staging
+      shell: powershell
+      env:
+        DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.STAGING_HOST }}
+        DEPLOY_USER: ${{ secrets.STAGING_USER }}
+      run: |
+        $DeployKey = $env:DEPLOY_KEY
+        $DeployHost = $env:DEPLOY_HOST
+        $DeployUser = $env:DEPLOY_USER
+        
+        # Save SSH key
+        $sshDir = "$HOME\.ssh"
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+        Set-Content -Path "$sshDir\deploy_key" -Value $DeployKey -Force
+        
+        # Deploy via SSH
+        ssh -i "$sshDir\deploy_key" "$DeployUser@$DeployHost" @"
+          cd /d C:\app\website
+          git pull origin develop
+          docker-compose pull
+          docker-compose up -d
+        "@
+
+  deploy-production:
+    needs: build-docker
+    runs-on: [self-hosted, windows, x64]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://your-domain.com
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Create Backup
+      shell: powershell
+      env:
+        DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+        DEPLOY_USER: ${{ secrets.PROD_USER }}
+        DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+      run: |
+        $DeployKey = $env:DEPLOY_KEY
+        $DeployHost = $env:PROD_HOST
+        $DeployUser = $env:PROD_USER
+        
+        $sshDir = "$HOME\.ssh"
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+        Set-Content -Path "$sshDir\deploy_key" -Value $DeployKey -Force
+        
+        ssh -i "$sshDir\deploy_key" "$DeployUser@$DeployHost" @"
+          cd /d C:\app\website
+          New-Item -ItemType Directory -Path C:\app\backups -Force | Out-Null
+          $BackupName = "backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"
+          docker-compose exec -T web PowerShell -Command "Compress-Archive -Path C:\app\publish -DestinationPath C:\app\backups\$BackupName" -ErrorAction SilentlyContinue
+        "@
+    
+    - name: Deploy to Production
+      shell: powershell
+      env:
+        DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+        DEPLOY_USER: ${{ secrets.PROD_USER }}
+      run: |
+        $DeployKey = $env:DEPLOY_KEY
+        $DeployHost = $env:DEPLOY_HOST
+        $DeployUser = $env:DEPLOY_USER
+        
+        $sshDir = "$HOME\.ssh"
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+        Set-Content -Path "$sshDir\deploy_key" -Value $DeployKey -Force
+        
+        $deployScript = @"
+          `$ErrorActionPreference = 'Stop'
+          cd /d C:\app\website
+          git pull origin main
+          docker-compose pull
+          docker-compose up -d
+          Start-Sleep -Seconds 10
+          docker-compose exec -T web dotnet migrate
+          
+          # Health check
+          for ([int]`$i=1; `$i -le 30; `$i++) {
+            try {
+              `$response = Invoke-WebRequest -Uri 'http://localhost/health' -UseBasicParsing -TimeoutSec 5
+              if (`$response.StatusCode -eq 200) {
+                Write-Host 'Health check passed! Production deployment successful.'
+                exit 0
+              }
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+          Write-Host 'Health check failed! Rolling back...'
+          docker-compose down
+          git reset --hard HEAD~1
+          docker-compose pull
+          docker-compose up -d
+          exit 1
+        "@
+        
+        ssh -i "$sshDir\deploy_key" "$DeployUser@$DeployHost" $deployScript
+
+  notify:
+    needs: [deploy-staging, deploy-production]
+    runs-on: [self-hosted, windows, x64]
+    if: always()
+    
+    steps:
+    - name: Notify Slack on Success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: 'Deployment successful! Check your application at the environment URL.'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+    
+    - name: Notify Slack on Failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: 'Deployment failed! Check the workflow logs for details.'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  cleanup:
+    needs: [deploy-staging, deploy-production]
+    runs-on: [self-hosted, windows, x64]
+    if: always()
+    
+    steps:
+    - name: Clean up Docker resources
+      shell: powershell
+      run: |
+        try {
+          # Remove dangling images
+          docker image prune -a -f --filter "until=24h"
+          
+          # Remove unused volumes
+          docker volume prune -f
+          
+          # Remove unused networks
+          docker network prune -f
+          
+          Write-Host "Docker cleanup completed"
+        } catch {
+          Write-Host "Docker cleanup had issues: $_"
+        }
